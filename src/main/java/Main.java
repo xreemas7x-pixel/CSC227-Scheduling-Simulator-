@@ -10,6 +10,17 @@ public class Main {
         Queue<PCB> readyQueue = new LinkedList<>();
 
         MemoryManager memory = new MemoryManager();
+        System.out.print(
+        "Enable Medium-Term Scheduler? (true/false): ");
+
+Scanner input = new Scanner(System.in);
+boolean enabled = input.nextBoolean();
+
+MediumTermScheduler mediumScheduler =
+        new MediumTermScheduler(
+                readyQueue, memory, enabled);
+
+mediumScheduler.start();
 
         JobLoader loader = new JobLoader(jobQueue);
         loader.start();
@@ -49,9 +60,11 @@ public class Main {
 
         // Give the scheduler time to continue
         Thread.sleep(200);
-
+mediumScheduler.evaluateAt(0);
         scheduler.stopScheduler();
         scheduler.join();
+        mediumScheduler.stopScheduler();
+mediumScheduler.join();
 
         System.out.println("\n--- Final Ready Queue ---");
 
