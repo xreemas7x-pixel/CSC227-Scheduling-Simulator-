@@ -1,5 +1,3 @@
-
-
 import java.util.ArrayList;
 import java.util.LinkedList;
 import java.util.List;
@@ -9,16 +7,23 @@ import java.util.Scanner;
 /**
  * Program entry point for CPU scheduling with long-term memory admission.
  * Scheduling rules are implemented ONLY in ShortTermScheduler.java.
- * Medium-term swapping is intentionally disabled until its team component
- * can be integrated with the shared simulated clock and queue states.
  */
 public final class IntegratedMain {
     private IntegratedMain() { }
+
+    private static boolean mediumTermEnabled;
 
     public static void main(String[] args) throws InterruptedException {
         System.out.println("================================");
         System.out.println("   CPU SCHEDULING SIMULATOR");
         System.out.println("================================");
+
+        // [Integration]
+        Scanner scanner = new Scanner(System.in);
+        System.out.print("Enable Medium-Term Scheduler? (y/n): ");
+        mediumTermEnabled = scanner.hasNext()
+                && scanner.next().trim().equalsIgnoreCase("y");
+        System.out.println();
         System.out.println("1. Shortest Job First (SJF)");
         System.out.println("2. Round Robin (5 ms)");
         System.out.println("3. Priority with Aging");
@@ -34,7 +39,6 @@ public final class IntegratedMain {
                 return;
             }
         } else {
-            Scanner scanner = new Scanner(System.in);
             choice = scanner.hasNextInt() ? scanner.nextInt() : 4;
         }
         switch (choice) {
@@ -74,12 +78,21 @@ public final class IntegratedMain {
         LongTermScheduler longTerm = new LongTermScheduler(
                 jobQueue, sharedReadyQueue, memory);
         longTerm.start();
+
+        // [Integration]
+        Queue<PCB> mediumTermQueue = new LinkedList<>();
+        MediumTermScheduler mediumTerm = new MediumTermScheduler(
+                mediumTermQueue, memory, mediumTermEnabled);
+        mediumTerm.start();
         try {
             ShortTermScheduler.Result result = ShortTermScheduler.runIntegrated(
-                    allJobs, algorithm, jobQueue, sharedReadyQueue, memory, longTerm);
+                    allJobs, algorithm, jobQueue, sharedReadyQueue, memory, longTerm,
+                    mediumTerm, mediumTermQueue);
             longTerm.join();
             result.print();
         } finally {
+            mediumTerm.stopScheduler();
+            mediumTerm.join();
             if (longTerm.isAlive()) {
                 longTerm.stopScheduler();
                 longTerm.join();
