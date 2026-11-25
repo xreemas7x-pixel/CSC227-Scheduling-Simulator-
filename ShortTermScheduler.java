@@ -1,4 +1,3 @@
-
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -17,9 +16,6 @@ import java.util.Set;
  * RR: 5-ms quantum; unfinished jobs return to the back of READY.
  * Priority: non-preemptive; priority 1 is highest; waiting jobs age every 4 ms.
  * Starvation: before FIRST dispatch, READY wait > (N at READY entry) * 5 ms.
- *
- * This version supports long-term admission but not medium-term swapping.
- * The medium-term scheduler requires a separate shared-clock / queue protocol.
  */
 public final class ShortTermScheduler {
     public static final int ROUND_ROBIN_QUANTUM = 5;
@@ -42,6 +38,9 @@ public final class ShortTermScheduler {
         int totalReadyWaiting;
         boolean firstDispatched;
         boolean starved;
+        // [Integration]
+        int suspendedSince;
+        int suspendedTime;
 
         Entry(PCB pcb, int inputOrder, int admittedAt, int nAtAdmission) {
             this.pcb = pcb;
@@ -163,7 +162,7 @@ public final class ShortTermScheduler {
                     if (e.starved) {
                         System.out.printf("  P%d waited %d ms before first dispatch, "
                                 + "N=%d, threshold=%d ms%n",
-                                e.pcb.processId, e.pcb.startTime - e.admittedAt,
+                                e.pcb.processId, e.pcb.startTime - e.admittedAt - e.suspendedTime,
                                 e.nAtAdmission, e.starvationLimit);
                     }
                 }
@@ -214,6 +213,20 @@ public final class ShortTermScheduler {
                 jobQueue, sharedReadyQueue, memory, longTerm).execute();
     }
 
+    // [Integration]
+    public static Result runIntegrated(List<PCB> allJobs, Algorithm algorithm,
+            Queue<PCB> jobQueue, Queue<PCB> sharedReadyQueue,
+            MemoryManager memory, LongTermScheduler longTerm,
+            MediumTermScheduler mediumTerm, Queue<PCB> mediumTermQueue)
+            throws InterruptedException {
+        validate(allJobs, algorithm);
+        Simulation sim = new Simulation(allJobs, algorithm,
+                jobQueue, sharedReadyQueue, memory, longTerm);
+        sim.mediumTerm = mediumTerm;
+        sim.mediumTermQueue = mediumTermQueue;
+        return sim.execute();
+    }
+
     private static void validate(List<PCB> processes, Algorithm algorithm) {
         if (processes == null || algorithm == null) {
             throw new IllegalArgumentException("Processes and algorithm are required");
@@ -243,6 +256,12 @@ public final class ShortTermScheduler {
         final List<String> agingEvents = new ArrayList<>();
         int time;
         int completed;
+
+        // [Integration]
+        MediumTermScheduler mediumTerm;
+        Queue<PCB> mediumTermQueue;
+        final Map<Integer, Entry> suspended = new HashMap<>();
+        int lastChecked = -1;
 
         Simulation(List<PCB> processes, Algorithm algorithm, Queue<PCB> jobQueue,
                 Queue<PCB> sharedReadyQueue, MemoryManager memory,
@@ -275,6 +294,14 @@ public final class ShortTermScheduler {
                 if (memory != null) {
                     admitAvailableJobs();
                 }
+                checkMediumTerm();
+                if (ready.isEmpty() && !suspended.isEmpty()) {
+                    admitAvailableJobs();
+                    if (ready.isEmpty()) {
+                        lastChecked = -1;
+                        checkMediumTerm();
+                    }
+                }
                 if (ready.isEmpty()) {
                     throw new IllegalStateException("No READY job available; check admission logic");
                 }
@@ -287,7 +314,7 @@ public final class ShortTermScheduler {
                     current.firstDispatched = true;
                     p.startTime = time;
                     if (algorithm == Algorithm.PRIORITY_WITH_AGING
-                            && time - current.admittedAt > current.starvationLimit) {
+                            && time - current.admittedAt - current.suspendedTime > current.starvationLimit) {
                         current.starved = true;
                     }
                 }
@@ -300,6 +327,11 @@ public final class ShortTermScheduler {
                     time++;
                     if (algorithm == Algorithm.PRIORITY_WITH_AGING) {
                         ageAndCheckStarvation();
+                    }
+                    // [Integration]
+                    if (mediumTerm != null && p.remainingTime > 0) {
+                        waitForLongTerm(p.memoryRequired);
+                        checkMediumTerm();
                     }
                 }
                 gantt.add(new GanttBlock(p.processId, start, time));
@@ -338,7 +370,7 @@ public final class ShortTermScheduler {
 
         void ageAndCheckStarvation() {
             for (Entry e : ready) {
-                if (!e.firstDispatched && time - e.admittedAt > e.starvationLimit) {
+                if (!e.firstDispatched && time - e.admittedAt - e.suspendedTime > e.starvationLimit) {
                     e.starved = true;
                 }
                 if (time >= e.nextAgingTime) {
@@ -349,6 +381,73 @@ public final class ShortTermScheduler {
                         agingEvents.add("[t=" + time + " ms] P" + e.pcb.processId
                                 + ": " + old + " -> " + e.effectivePriority);
                     }
+                }
+            }
+        }
+
+        // [Integration]
+        void checkMediumTerm() throws InterruptedException {
+            if (mediumTerm == null || time == lastChecked) {
+                return;
+            }
+            lastChecked = time;
+
+            synchronized (mediumTermQueue) {
+                mediumTermQueue.clear();
+                for (Entry e : ready) {
+                    mediumTermQueue.add(e.pcb);
+                }
+            }
+
+            mediumTerm.evaluateAt(time);
+
+            synchronized (mediumTermQueue) {
+                // swapped out
+                for (Entry e : new ArrayList<>(ready)) {
+                    if (!mediumTermQueue.contains(e.pcb)) {
+                        e.totalReadyWaiting += time - e.readySince;
+                        e.suspendedSince = time;
+                        ready.remove(e);
+                        suspended.put(e.pcb.processId, e);
+                    }
+                }
+                // swapped in
+                for (PCB p : mediumTermQueue) {
+                    Entry e = suspended.remove(p.processId);
+                    if (e != null) {
+                        e.suspendedTime += time - e.suspendedSince;
+                        e.readySince = time;
+                        e.nextAgingTime = time + AGING_INTERVAL;
+                        ready.add(e);
+                    }
+                }
+            }
+        }
+
+        // [Integration]
+        void waitForLongTerm(int runningMemory) throws InterruptedException {
+            while (true) {
+                synchronized (sharedReadyQueue) {
+                    while (!sharedReadyQueue.isEmpty()) {
+                        admit(sharedReadyQueue.poll(), time);
+                    }
+                }
+                int accounted = runningMemory;
+                for (Entry e : ready) {
+                    accounted += e.pcb.memoryRequired;
+                }
+                int used = memory.getUsedMemory();
+                PCB next;
+                synchronized (jobQueue) {
+                    next = jobQueue.peek();
+                }
+                boolean settled = accounted == used && (next == null
+                        || next.memoryRequired > MemoryManager.TOTAL_MEMORY - used);
+                if (settled || (!longTerm.isAlive() && accounted == used)) {
+                    return;
+                }
+                synchronized (sharedReadyQueue) {
+                    sharedReadyQueue.wait(2);
                 }
             }
         }
